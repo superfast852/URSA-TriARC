@@ -7,8 +7,9 @@
 from demo import *
 import gymnasium as gym
 from gymnasium import spaces
-from stable_baselines3 import SAC
-from stable_baselines3.common.vec_env import DummyVecEnv, VecVideoRecorder
+from experimental.dflf_custom_opts import MultiStepSAC, MultiStepTDBuffer
+from torch.nn import ReLU
+from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from wandb.integration.sb3 import WandbCallback
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
@@ -309,17 +310,24 @@ def make_env():
 env = DummyVecEnv([make_env])
 
 # ---- Model ----
-model = SAC(
+model = MultiStepSAC(
     "MlpPolicy",
     env,
     verbose=1,
     buffer_size=buf_size,
-    replay_buffer_class=HDRABuffer,
-    replay_buffer_kwargs={"N": 10, "penalty_scale": 1.0},
-    learning_starts=10_000,
+    replay_buffer_class=MultiStepTDBuffer,
+    replay_buffer_kwargs={"n_steps": 3,
+                          "gamma": 0.96,
+                          "N": 10,
+                          "penalty_scale": 1.0},
+    learning_rate=3e-3,
+    # learning_starts=10_000,
     gradient_steps=1,
     train_freq=(1, "step"),
     batch_size=512,
+    policy_kwargs=dict(net_arch=dict(pi=[256, 256], qf=[256, 256]),
+                       activation_fn=ReLU),
+    ent_coef='auto',
 )
 
 model.learn(total_timesteps=epochs,

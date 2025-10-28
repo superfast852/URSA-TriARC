@@ -207,6 +207,7 @@ class WandBVideoLogger(BaseCallback):
         super().__init__(verbose)
         self.video_env = video_env
         self.log_freq = log_freq
+        self.video_log_freq = log_freq*10
         self.name = name
         self.max_videos = max_videos
         self.video_count = 0
@@ -217,7 +218,7 @@ class WandBVideoLogger(BaseCallback):
     def video_path(self):
         return VIDEO_FOLDER + self.video_name
 
-    def _log(self) -> None:
+    def _log(self, log_video=True) -> None:
         try:
             print("Logging to wandb...")
             wandb.log({"landmark_count": env.envs[0].env.hit_lms})
@@ -225,9 +226,12 @@ class WandBVideoLogger(BaseCallback):
             lt = env.envs[0].env.pp.laptime
             if lt > 5:
                 wandb.log({"laptime": lt})
-            wandb.log({
-                f"{self.name}/video": wandb.Video(self.video_path, format="mp4")
-            })
+            if log_video:
+                print(f"[VideoLogger] Recording rollout #{self.video_index} at {self.num_timesteps} steps...")
+                self._record()
+                wandb.log({
+                    f"{self.name}/video": wandb.Video(self.video_path, format="mp4")
+                })
         except Exception as e:
             print("Failed to log:", e)
 
@@ -250,15 +254,9 @@ class WandBVideoLogger(BaseCallback):
 
     def _on_step(self) -> bool:
         if self.num_timesteps % self.log_freq == 0:
-            self.video_index += 1
             self.video_name = f"rollout_{self.video_index:03d}.mp4"
-
-            print(f"[VideoLogger] Recording rollout #{self.video_index} at {self.num_timesteps} steps...")
-            def full_log():
-                self._record()
-                self._log()
-            # Thread(target=full_log, daemon=False).start()  # THIS DOES NOT WORK.
-            full_log()
+            self.video_index += 1
+            self._log(self.num_timesteps % self.video_log_freq == 0)
 
         return True
 
@@ -267,7 +265,7 @@ if __name__ == '__main__':
     # ---- Configuration ----
     epochs = 1_000_000
     buf_size = 10_000_000
-    log_freq = 100_000
+    log_freq = 10_000
     config = {
         "policy_type": "MlpPolicy",
         "total_timesteps": epochs,

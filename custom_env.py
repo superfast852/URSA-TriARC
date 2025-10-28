@@ -16,7 +16,8 @@ from stable_baselines3.common.buffers import ReplayBuffer
 import cv2, time, wandb
 from os import makedirs
 
-VIDEO_FOLDER = "./videos/" + time.strftime("%Y%m%d-%H%M%S") + "/"
+VIDEO_FOLDER = "./videos/" + time.strftime("%Y|%m|%d - %H:%M:%S") + "/"
+DT = 1/60
 makedirs(VIDEO_FOLDER, exist_ok=True)
 
 class HDRABuffer(ReplayBuffer):
@@ -41,36 +42,37 @@ class DrivingEnv(gym.Env):
         "render_fps": 60
     }
 
-    def __init__(self, map_path: str | tuple | list = "miami_optimized.png", lidar_res=20, max_speed=7,
-                 max_steering_angle=np.deg2rad(45), sectors=150, lad=30, render_mode="rgb_array",
-                 realtime=False, norm_vel_input=True):
+    def __init__(self, map_path: str | tuple | list = "miami_optimized.png", render_mode="rgb_array",
+                 lidar_res=20, sectors=150, lad=30,
+                 max_speed=10, wheelbase=1.0, pp_max_speed=9.0,
+                 realtime=False, norm_vel_input=True, dt=1/60):
 
         self.lidar_res = lidar_res
         self.max_speed = max_speed
-        self.max_steering_angle = max_steering_angle
+        self.pp_max_speed = pp_max_speed
+        self.lad = lad
+        self.max_steering_angle = np.deg2rad(45)  # this is STANDARD from here on out.
         self.nvi = norm_vel_input
+        self.runs = 0
+        self.hit_lms = 0
+        self.dt = dt
+
         self.multi = False
         if isinstance(map_path, list) or isinstance(map_path, tuple):
             self.sims = [Sim(m, race_neg=True,
-                             max_steering_angle=max_steering_angle,
                              lidar_res=lidar_res, max_speed=max_speed,
-                             realtime=realtime) for m in map_path]
+                             realtime=realtime, wheelbase=wheelbase, dt=dt) for m in map_path]
             self.lines = [discretize_line(s.full_centerline, sectors) for s in self.sims]
             self.sim = self.sims[0]
             self.multi = True
             self.line = self.lines[0]
         else:
             self.sim = Sim(map_path, race_neg=True,
-                           max_steering_angle=max_steering_angle,
                            lidar_res=lidar_res, max_speed=max_speed,
-                           realtime=realtime)
+                           realtime=realtime, wheelbase=wheelbase, dt=dt)
             self.line = discretize_line(self.sim.full_centerline, sectors)
 
-        self.runs = 0
-        self.hit_lms = 0
-        self.lad = lad
-
-        self.pp = PurePursuit(self.line, lad)
+        self.pp = PurePursuit(self.line, lad, max_speed=pp_max_speed)
         self.prev_endpoint = self.pp.curr_idx
         self.norm_angle = lambda x: np.arctan2(np.sin(x), np.cos(x))
         self.render_mode = render_mode
@@ -95,9 +97,7 @@ class DrivingEnv(gym.Env):
         theta = np.arctan2(*(self.line[(point_idx + 1) % len(self.line)]
                              - self.line[point_idx])[::-1])
         if set:
-            self.sim.car.x = px
-            self.sim.car.y = py
-            self.sim.car.theta = theta
+            self.sim.car.pose = np.array([px, py, theta])
         return px, py, theta
 
     def reset(self, seed=None, options=None):
@@ -106,15 +106,13 @@ class DrivingEnv(gym.Env):
             self.sim = self.sims[i]
             self.line = self.lines[i]
         self.random_location()
-        self.pp = PurePursuit(self.line, self.lad)
+        self.pp = PurePursuit(self.line, self.lad, self.pp_max_speed)
         self.prev_endpoint = self.pp.find_waypoint(self.sim.get_pose())
-        self.sim.crashed = False
-        self.sim.car.velocity = 0.0
-        self.sim.car.tr = 0.0
-        self.sim.car.omega = 0.0
-        self.sim.car.prev_omega = 0.0
-        self.sim.car.prev_steering_angle = 0.0
 
+        self.sim.crashed = False
+        self.sim.car.speed = 0.0
+        self.sim.car.steering = 0.0
+        self.sim.v = np.array([0., 0., 0.])
         self.hit_lms = 0
 
         if self.sim.real_time:
@@ -122,8 +120,10 @@ class DrivingEnv(gym.Env):
         return self._get_obs(), {}
 
     def step(self, action):
+        # TODO: if we're changing the car's output, won't pure pursuit fight the residuals?
+        # Because if we're steering away from the pp yaw, pp will want to correct, right?
+
         v, w = action * [0.2*self.max_speed, 0.2617994]  # add 20% of max speed, and 15 deg steering
-        # self.pp.find_waypoint(self.sim.get_pose())
         ppv, pps = self.pp(self.sim.get_pose())
         self.sim.update(v+ppv, w+pps)
 
@@ -135,18 +135,20 @@ class DrivingEnv(gym.Env):
         return obs, reward, done, False, {}
 
     def _get_obs(self):
-        pose, (_, polars), _ = self.sim.get_state()
+        pose, polars = self.sim.get_state(minimal=True)
+
+        # TODO: the lidar class in sim is shit. rework it. we've done better than this. ~5 months ago.
         dists = np.array([p[0] for p in polars], dtype=np.float32) / self.sim.lidar.max_steps
-        car_info = np.array([self.sim.car.velocity, self.norm_angle(self.sim.car.theta)], dtype=np.float32)
+        car_info = np.array([self.sim.car.speed, self.sim.car.steering], dtype=np.float32)
         if self.nvi:
-            car_info /= [self.max_speed, np.pi]
+            car_info /= [self.max_speed, self.max_steering_angle]
         return np.concatenate([dists, car_info])
 
     def _compute_reward_old(self):
         target = self.line[self.pp.curr_idx]
         pose = self.sim.get_pose()
         dist = np.linalg.norm(target - np.array(pose[:2]))
-        reward = self.sim.car.velocity * 0.1 - dist * 0.15  # small penalty for distance, motivate speed
+        reward = self.sim.car.speed * 0.1 - dist * 0.15  # small penalty for distance, motivate speed
         # TODO: encourage lap time instead of raw speed.
         if self.prev_endpoint != self.pp.curr_idx:
             reward += 5.0
@@ -193,11 +195,8 @@ class DrivingEnv(gym.Env):
         img = self.sim.map.animate(pose=self.sim.get_pose(), show=False)
         for i, pt in enumerate(self.line):
             cv2.circle(img, tuple(pt.astype(int)), 2, (0, 0, 255) if i == self.pp.curr_idx else (255, 0, 0), -1)
-        img = draw_controls_overlay(img, self.sim.car.velocity, self.sim.car.theta, self.max_speed,
+        img = draw_controls_overlay(img, self.sim.car.speed, self.sim.car.steering, self.max_speed,
                                     self.max_steering_angle)
-        # if self.render_mode == "human":
-        #     cv2.imshow("Driving", img)
-        #     cv2.waitKey(1)
         return img
 
 
@@ -234,7 +233,7 @@ class WandBVideoLogger(BaseCallback):
         obs, _ = self.video_env.reset()
         init_size = self.video_env.render().shape
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        w = cv2.VideoWriter(self.video_path, fourcc, 60.0, (init_size[1], init_size[0]))
+        w = cv2.VideoWriter(self.video_path, fourcc, int(1/DT), (init_size[1], init_size[0]))
         for n in range(10000):  # short rollout
             action, _ = self.model.predict(np.array(obs), deterministic=True)
             obs, _, done, *_ = self.video_env.step(action)
@@ -260,7 +259,7 @@ class WandBVideoLogger(BaseCallback):
 
 # ---- Configuration ----
 epochs = 100_000
-buf_size = 1000
+buf_size = 1_000_000
 log_freq = 2500
 config = {
     "policy_type": "MlpPolicy",
@@ -268,6 +267,11 @@ config = {
     "env_name": "TrackBlitz"
 }
 
+# ---- Sim Parameters ----
+wheelbase = 1.25
+lookahead_distance = 25
+max_speed = 10
+pp_max_speed = max_speed*0.9
 run = wandb.init(
     project="gg_experiments",
     config=config,
@@ -276,8 +280,9 @@ run = wandb.init(
     save_code=True,
 )
 vid_env = DrivingEnv("./tracks/miami_optimized.png",
-                     realtime=False, lidar_res=30,
-                     norm_vel_input=True)
+                     wheelbase=wheelbase, max_speed=max_speed,
+                     lad=lookahead_distance, pp_max_speed=pp_max_speed,
+                     dt=DT)
 
 callbacks = CallbackList([
     WandbCallback(
@@ -294,8 +299,9 @@ def make_env():
     env = DrivingEnv(map_path=("./tracks/miami_optimized.png",
                                "./tracks/racetrack.png",
                                "./tracks/zandvoort.png"),
-                     realtime=False, lidar_res=30,
-                     norm_vel_input=True)
+                     wheelbase=wheelbase, max_speed=max_speed,
+                     lad=lookahead_distance, pp_max_speed=pp_max_speed,
+                     dt=DT)
     env = Monitor(env)
     return env
 
@@ -323,9 +329,9 @@ for ep in range(episodes):
     obs, info = env.reset()
     for i in range(1000):
         action, _states = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(action)
+        obs, reward, terminated, *_ = env.step(action)
         img = env.render()
 
-        if terminated or truncated:
+        if terminated:
             obs, info = env.reset()
             break

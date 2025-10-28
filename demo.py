@@ -2,9 +2,15 @@ import numpy as np
 from NavStack import Map, RRT
 import cv2
 import math
-from time import sleep, time
+from time import sleep, time, strftime
 from numba import njit, typed
 from TrackParsing import parse_trackimg, discretize_line
+
+"""
+STABLE CONFIGURATIONS:
+max_speed=10, lad=25, L=1.25, steering_bias=1.15, pp_max=0.9  # For training, set steering_bias=1.15
+lap_time = 16.6
+"""
 
 pmap = map
 inbounds = lambda x, y, m: 0 <= x < m.shape[1] and 0 <= y < m.shape[0]
@@ -30,7 +36,7 @@ class AckermannSteering:
     Simulates an Ackermann steering robot in real-life conditions.
     """
     def __init__(self, wheelbase=2, max_steering_angle=np.deg2rad(45),
-                 acceleration=4, max_speed=10, braking=8, dt=1/60, fric=1.55):
+                 acceleration=4, max_speed=10, braking=4, dt=1/60, fric=1.55):
         """
         Initializes the simulation class.
 
@@ -85,17 +91,16 @@ class AckermannSteering:
         return Fx / 4.0
 
     def simple_accel(self, throttle, dt):
-        print(self.speed, end=" ")
         # --- Apply longitudinal friction
+        sign = self._sign(throttle)
         if abs(throttle) < abs(self.speed):
-            sign = np.sign(throttle)
-            self.speed -= sign * self.braking_force * dt # Avoid overshooting past 0
-            if np.sign(self.speed) != sign:
+            if abs(self.speed) < 0.05:
                 self.speed = 0.0
+            else:
+                self.speed -= self.braking_force * dt * sign # Avoid overshooting past 0
         elif abs(throttle) > 0.01:
-            self.speed += (self.a * dt * self._sign(throttle))
+            self.speed += (self.a * dt * sign)
             # * (2.0 if self._sign(target_speed) != self._sign(self.speed) else 1.0))
-        print(self.speed)
 
     @staticmethod
     def _sign(a):
@@ -192,6 +197,7 @@ class Sim:
                     lidar_res=20, realtime=True, dt=1/60, full_stop=False,
                  **kwargs):
         # TODO: add resizing of map images :p
+        # future me here. what??
         self.full_centerline = np.empty((0, 2))
         if isinstance(map, str) and "." in map and map.split(".")[-1] in ["jpeg", "jpg", "png"]:
             map, self.full_centerline = parse_trackimg(map, race_neg)
@@ -217,12 +223,14 @@ class Sim:
         self.crashed = False
 
 
-    def get_state(self):
+    def get_state(self, minimal=False):
         pose = self.get_pose()
 
         pose[0] = int(pose[0])
         pose[1] = int(pose[1])
         self.scan = self.lidar.get_scan(pose)
+        if minimal:
+            return pose, self.scan[1]
         frame, polars = self.scan
         frame = np.clip(np.array(frame, dtype=int) - pose[:2] + self.map.map_center, 0, self.mapres-1)[:, ::-1].T.tolist()
         lidar_view = np.zeros((self.mapres, self.mapres, 3), np.uint8)
@@ -236,7 +244,6 @@ class Sim:
         self.car.update(v, w, self.dt)
         self.crashed = self.hasCrashed()
         if self.crashed:  # crashed
-            print("oh no!")
             self.car.pose[:2] = self.prev_pose
             if self.fs:
                 self.car.v = np.zeros(3)
@@ -251,40 +258,55 @@ class Sim:
 
 
 class PurePursuit:
-    def __init__(self, path, lad, max_speed=10, full_throttle_pad=np.deg2rad(10), max_turn=np.deg2rad(45)):
+    def __init__(self, path, lad, max_speed=10.0, steering_bias=1.0, print_laptime=False):
         self.p = path
         self.lad = lad
+        self.ms = max_speed
+        self.max_turn = np.deg2rad(45)
+        self.segcount = len(self.p)
+        self.steering_bias = steering_bias  # 1.15 is a good steering bias
+
+        # Waypoint management
         self.target = self.p[0]
         self.curr_idx = -1
-        self.full_throttle_pad = full_throttle_pad
-        self.ms = max_speed
         self.initial_idx = 0
+
+        # Laps/timekeeping
         self.laps = 0
         self.start_time = time()
         self.laptime = 0.0
-        self.max_turn = max_turn
-        self.segcount = len(self.p)
+        self.print_laptime = print_laptime
 
-    def __call__(self, pose, curv_segment_length=7, fric=1.55):
+
+    def __call__(self, pose, curv_segment_length=10, fric=1.20):
         self.curr_idx = int(self.find_waypoint(pose))
         tg = self.p[self.curr_idx]
         steer = self.getSteer(pose, tg)
 
-        # To account for looping. yes, a lot. Maybe implement circular indexing overloading?
-        segment_indices = list(range(self.curr_idx, self.curr_idx + curv_segment_length))
-        segment_indices = [i%self.segcount for i in segment_indices]
-        points = self.p[segment_indices]
-        curv = np.sum(np.abs(segment_curvature(points)))
-        max_speed = speed_limit(fric, curv)
-        # print(max_speed)
-        v = np.clip(max_speed, -self.ms, self.ms)
+        v = self.getSpeed(curv_segment_length, fric)
         if v < 2.5:
             v = 2.5
         return v, steer
 
     def getSteer(self, pose, tg):
         att = np.arctan2(tg[1] - pose[1], tg[0] - pose[0])
-        return np.arctan2(np.sin(att - pose[2]), np.cos(att - pose[2]))
+        return np.arctan2(np.sin(att - pose[2]), np.cos(att - pose[2]))*self.steering_bias
+
+    def getSpeed(self, curv_segment_length, fric):
+        # To account for looping. yes, a lot. Maybe implement circular indexing overloading?
+        if curv_segment_length < 3:
+            # get instantaneous curvature
+            p1, p2, p3 = self.curr_idx - 1, self.curr_idx, self.curr_idx + 1
+            p1 %= self.segcount
+            p3 %= self.segcount
+            curv = curvature(self.p[p1], self.p[p2], self.p[p3])
+        else:
+            segment_indices = list(range(self.curr_idx, self.curr_idx + curv_segment_length))
+            segment_indices = [i % self.segcount for i in segment_indices]
+            points = self.p[segment_indices]
+            curv = np.sum(np.abs(segment_curvature(points)))
+        max_speed = speed_limit(fric, curv)
+        return np.clip(max_speed, -self.ms, self.ms)
 
     def find_waypoint(self, pose, update=True, reset=False):
         if self.curr_idx == -1 or reset:
@@ -297,13 +319,15 @@ class PurePursuit:
             if curr_idx == self.initial_idx and update:
                 self.laps += 1
                 self.laptime = time() - self.start_time
-                # print(f"Laps: {self.laps} | time: {self.laptime:.2f}s")
+                if self.print_laptime:
+                    print(f"Laps: {self.laps} | time: {self.laptime:.2f}s")
                 self.start_time = time()
         else:
             curr_idx = self.curr_idx
         if update:
             self.curr_idx = curr_idx
         return curr_idx
+
 
 def draw_controls_overlay(img, velocity, steering_angle, max_speed, max_steering_angle=np.deg2rad(45)):
     """
@@ -343,33 +367,34 @@ def draw_controls_overlay(img, velocity, steering_angle, max_speed, max_steering
 
 if __name__ == '__main__':
     from ctrl import XboxController
-
+    will_record = False
     max_speed = 10
-    lad = 30
-    steer_speed = 1.0
-    sim = Sim(map="./tracks/miami_optimized.png", race_neg=True, lidar_res=30, max_speed=max_speed, realtime=True)
-    sim.car.wheelbase = steer_speed  # yes, the smaller the wheelbase, the faster the car will spin.
-    # sim.car.braking_force *= 10
+    lad = 25
+    steer_speed = 1.2
+
+    sim = Sim(map="./tracks/zandvoort.png", race_neg=True, lidar_res=30, max_speed=max_speed, realtime=not will_record)
+    sim.car.wheelbase = steer_speed  # smaller wheelbase → faster turning
     c = XboxController(0)
-    pp = PurePursuit(discretize_line(sim.full_centerline, 350), lad, max_speed*0.7)
-    start_point = pp.p[0]
+    pp = PurePursuit(discretize_line(sim.full_centerline, 350), lad, max_speed*0.9)
     sim.car.pose[:2] = pp.p[0] * sim.mapm / sim.mapres
     sim.car.pose[2] = np.arctan2(*(pp.p[1] - pp.p[0])[::-1])
 
     running = True
     control = True
 
+    # --- Racing line visualization ---
+    view_racing_line = False
+    recording = False
+    trajectory = []
 
     def stop():
         global running, pp
         pp = PurePursuit(discretize_line(sim.full_centerline), lad)
         running = False
 
-
     def swap_control():
         global control
         control = not control
-
 
     def random_location():
         point_idx = np.random.randint(0, len(pp.p))
@@ -378,27 +403,64 @@ if __name__ == '__main__':
                              - pp.p[point_idx])[::-1])
         sim.car.pose = np.array((px, py, theta))
 
+    def toggle_raceline():
+        global view_racing_line, recording, trajectory, pp
+        view_racing_line = not view_racing_line
+        recording = False
+        trajectory = []
+        pp.print_laptime = view_racing_line
+        print(f"Racing line viewer: {'ON' if view_racing_line else 'OFF'}")
 
+    # Register controller triggers
     c.setTrigger("Start", stop)
     c.setTrigger("A", swap_control)
     c.setTrigger("B", random_location)
-    # get raceline
+    c.setTrigger("Y", toggle_raceline)
 
     while running:
         pose, (frame, polars), lidar_view = sim.get_state()
         if control:
             turn = c.RJoyX / 10
             sim.car.pose[2] += turn if abs(turn) > 0.03 else 0
-
             v = (c.RT - c.LT) * max_speed
             steer = sim.car.max_steering_angle * c.LJoyX
         else:
             v, steer = pp(pose)
+
         sim.update(v, steer)
         img = sim.map.animate(pose=sim.get_pose(), show=False)
-        for i, pt in enumerate(pp.p):
-            cv2.circle(img, tuple(pt.astype(int)), 2, (0, 0, 255) if i == pp.curr_idx else (255, 0, 0), -1)
-        img = np.hstack([lidar_view, img])
         img = draw_controls_overlay(img, sim.car.speed, steer, max_speed)
+
+        # Draw centerline + pursuit point
+        for i, pt in enumerate(pp.p):
+            color = (0, 0, 255) if i == pp.curr_idx else (255, 0, 0)
+            cv2.circle(img, tuple(pt.astype(int)), 2, color, -1)
+
+        # --- Racing line viewer logic ---
+        if view_racing_line:
+            # Detect crossing start/finish line (around index 0)
+            if pp.curr_idx == 0 and not recording:
+                if will_record:
+                    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                    w = cv2.VideoWriter('./videos/demo_runs/lap_'+strftime('%H:%M:%S')+'.avi', fourcc, 1/sim.dt, img.shape[::-1][1:])
+                recording = True
+                trajectory = []
+                print("Recording racing line...")
+
+            # Store path as we move
+            if recording:
+                trajectory.append(sim.get_pose()[:2])
+
+                # Draw in green
+                for i in range(1, len(trajectory)):
+                    p1 = tuple(np.int32(trajectory[i - 1]))
+                    p2 = tuple(np.int32(trajectory[i]))
+                    cv2.line(img, p1, p2, (0, 255, 0), 2)
+                if will_record:
+                    w.write(img)
+
+        # img = np.hstack([lidar_view, img])
+        # img = draw_controls_overlay(img, sim.car.speed, steer, max_speed)
         cv2.imshow("Sim car", img)
-        cv2.waitKey(1)
+        cv2.waitKey(int(100/6) if will_record else 1)
+    w.release()

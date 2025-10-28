@@ -8,13 +8,14 @@ from demo import *
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import SAC
-from stable_baselines3.common.vec_env import DummyVecEnv, VecVideoRecorder
-from stable_baselines3.common.monitor import Monitor
 from wandb.integration.sb3 import WandbCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.buffers import ReplayBuffer
 import cv2, time, wandb
 from os import makedirs
+# from threading import Thread  # AGAIN. THIS DOES NOT WORK.
 
 VIDEO_FOLDER = "./videos/" + time.strftime("%Y|%m|%d - %H:%M:%S") + "/"
 DT = 1/60
@@ -253,90 +254,95 @@ class WandBVideoLogger(BaseCallback):
             self.video_name = f"rollout_{self.video_index:03d}.mp4"
 
             print(f"[VideoLogger] Recording rollout #{self.video_index} at {self.num_timesteps} steps...")
-            self._record()
-            self._log()
+            def full_log():
+                self._record()
+                self._log()
+            # Thread(target=full_log, daemon=False).start()  # THIS DOES NOT WORK.
+            full_log()
 
         return True
 
-# ---- Configuration ----
-epochs = 100_000
-buf_size = 10_000_000
-log_freq = 10_000
-config = {
-    "policy_type": "MlpPolicy",
-    "total_timesteps": epochs,
-    "env_name": "TrackBlitz"
-}
 
-# ---- Sim Parameters ----
-wheelbase = 1.25
-lookahead_distance = 25
-max_speed = 10
-pp_max_speed = max_speed*0.9
-run = wandb.init(
-    project="gg_experiments",
-    config=config,
-    sync_tensorboard=True,
-    monitor_gym=True,
-    save_code=True,
-)
-vid_env = DrivingEnv("./tracks/miami_optimized.png",
-                     wheelbase=wheelbase, max_speed=max_speed,
-                     lad=lookahead_distance, pp_max_speed=pp_max_speed,
-                     dt=DT)
-
-callbacks = CallbackList([
-    WandbCallback(
-        model_save_path=f"runs/{run.id}/models",
-        verbose=1
-    ),
-    WandBVideoLogger(
-        video_env=vid_env,
-        log_freq=log_freq,
-        name="car_racing"
+if __name__ == '__main__':
+    # ---- Configuration ----
+    epochs = 1_000_000
+    buf_size = 10_000_000
+    log_freq = 100_000
+    config = {
+        "policy_type": "MlpPolicy",
+        "total_timesteps": epochs,
+        "env_name": "TrackBlitz"
+    }
+    
+    # ---- Sim Parameters ----
+    wheelbase = 1.25
+    lookahead_distance = 25
+    max_speed = 10
+    pp_max_speed = max_speed*0.9
+    run = wandb.init(
+        project="gg_experiments",
+        config=config,
+        sync_tensorboard=True,
+        monitor_gym=True,
+        save_code=True,
     )
-])
-def make_env():
-    env = DrivingEnv(map_path=("./tracks/miami_optimized.png",
-                               "./tracks/racetrack.png",
-                               "./tracks/zandvoort.png"),
-                     wheelbase=wheelbase, max_speed=max_speed,
-                     lad=lookahead_distance, pp_max_speed=pp_max_speed,
-                     dt=DT)
-    env = Monitor(env)
-    return env
-
-env = DummyVecEnv([make_env])
-
-# ---- Model ----
-model = SAC(
-    "MlpPolicy",
-    env,
-    verbose=1,
-    buffer_size=buf_size,
-    replay_buffer_class=HDRABuffer,
-    replay_buffer_kwargs={"N": 10, "penalty_scale": 1.0},
-    learning_starts=10_000,
-    gradient_steps=1,
-    train_freq=(1, "step"),
-    batch_size=512,
-)
-
-model.learn(total_timesteps=epochs,
-            callback=callbacks,
-            log_interval=log_freq,
-            progress_bar=True
-            )
-model.save(f"runs/{run.id}/models/sac_car_racing_end")
-run.finish()
-episodes = 10
-for ep in range(episodes):
-    obs, info = env.reset()
-    for i in range(1000):
-        action, _states = model.predict(obs, deterministic=True)
-        obs, reward, terminated, *_ = env.step(action)
-        img = env.render()
-
-        if terminated:
-            obs, info = env.reset()
-            break
+    vid_env = DrivingEnv("./tracks/miami_optimized.png",
+                         wheelbase=wheelbase, max_speed=max_speed,
+                         lad=lookahead_distance, pp_max_speed=pp_max_speed,
+                         dt=DT)
+    
+    callbacks = CallbackList([
+        WandbCallback(
+            model_save_path=f"runs/{run.id}/models",
+            verbose=1
+        ),
+        WandBVideoLogger(
+            video_env=vid_env,
+            log_freq=log_freq,
+            name="car_racing"
+        )
+    ])
+    def make_env():
+        env = DrivingEnv(map_path=("./tracks/miami_optimized.png",
+                                   "./tracks/racetrack.png",
+                                   "./tracks/zandvoort.png"),
+                         wheelbase=wheelbase, max_speed=max_speed,
+                         lad=lookahead_distance, pp_max_speed=pp_max_speed,
+                         dt=DT)
+        env = Monitor(env)
+        return env
+    
+    env = DummyVecEnv([make_env])
+    
+    # ---- Model ----
+    model = SAC(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        buffer_size=buf_size,
+        replay_buffer_class=HDRABuffer,
+        replay_buffer_kwargs={"N": 10, "penalty_scale": 1.0},
+    )
+    
+    model.learn(total_timesteps=epochs,
+                callback=callbacks,
+                log_interval=log_freq,
+                progress_bar=True
+                )
+    model.save(f"runs/{run.id}/models/sac_car_racing_end")
+    run.finish()
+    episodes = 10
+    env = DrivingEnv("./tracks/miami_optimized.png",
+                         wheelbase=wheelbase, max_speed=max_speed,
+                         lad=lookahead_distance, pp_max_speed=pp_max_speed,
+                         dt=DT)
+    for ep in range(episodes):
+        obs, info = env.reset()
+        for i in range(1000):
+            action, states = model.predict(obs, deterministic=True)
+            obs, reward, terminated, *_ = env.step(action)
+            img = env.render()
+    
+            if terminated:
+                obs, info = env.reset()
+                break

@@ -281,7 +281,7 @@ run = wandb.init(
     monitor_gym=True,
     save_code=True,
 )
-vid_env = DrivingEnv("./tracks/miami_optimized.png",
+vid_env = DrivingEnv("../tracks/miami_optimized.png",
                      wheelbase=wheelbase, max_speed=max_speed,
                      lad=lookahead_distance, pp_max_speed=pp_max_speed,
                      dt=DT)

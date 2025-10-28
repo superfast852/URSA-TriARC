@@ -1,10 +1,10 @@
-gymnasium~=1.1.1
+gymnasium~=1.2.1
 opencv-python~=4.12.0.88
-wandb~=0.21.0
-stable_baselines3~=2.6.0
+wandb~=0.22.2
+stable_baselines3~=2.7.0
 evdev~=1.9.2
 numpy~=2.2.6
-numba~=0.61.2
-shapely~=2.0.7
-scipy~=1.15.2
+numba~=0.62.1
+shapely~=2.1.2
+scipy~=1.15.3
 scikit-image~=0.25.2
